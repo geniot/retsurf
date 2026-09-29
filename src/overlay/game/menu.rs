@@ -18,15 +18,17 @@ pub enum GameRow {
     InputMap,
     /// Summon the on-screen keyboard; it types into the page.
     Osk,
+    /// Quit retsurf
+    Quit,
 }
 
 impl GameRow {
     /// Top-to-bottom order, which is also the selection index.
     pub const ALL: [GameRow; 4] = [
-        GameRow::Toggle,
         GameRow::Resume,
         GameRow::InputMap,
         GameRow::Osk,
+        GameRow::Quit,
     ];
 
     /// The row's label. Only the toggle words itself by state; the panel is
@@ -43,6 +45,7 @@ impl GameRow {
             (GameRow::Osk, _) => "On-screen keyboard",
             (GameRow::Toggle, true) => "Disable",
             (GameRow::Toggle, false) => "Enable",
+            (GameRow::Quit, _) => "Quit",
         }
     }
 }

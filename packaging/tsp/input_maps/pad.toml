@@ -1,0 +1,5 @@
+name = "Gamepad passthrough"
+
+[pad]
+l1 = "key.s"
+l2 = "key.a"

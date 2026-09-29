@@ -38,9 +38,15 @@ impl InputMap {
     }
 }
 
+fn map_path_dir() -> String {
+    if let Ok(dir) = std::env::var("RETSURF_MAP_DIR") {
+        return dir
+    }
+    format!("{}{MAP_DIR}", config::data_dir())
+}
 /// Where a map of this id is read from and written to.
 fn map_path(id: &str) -> String {
-    format!("{}{MAP_DIR}/{id}.toml", config::data_dir())
+    format!("{}/{id}.toml", map_path_dir())
 }
 
 /// Write one map's file, reporting whether it is now on disk.
@@ -181,7 +187,7 @@ pub(super) fn parse_built_in(id: &str, text: &str) -> RawInputMap {
 /// Read every `input_maps/*.toml`, keyed by file stem. A malformed file is logged
 /// and skipped, like a malformed `bindings.toml`.
 fn read_dir() -> BTreeMap<String, RawInputMap> {
-    let dir = format!("{}{MAP_DIR}", config::data_dir());
+    let dir = map_path_dir();//format!("{}{MAP_DIR}", config::data_dir());
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return BTreeMap::new();
     };

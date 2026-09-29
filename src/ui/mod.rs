@@ -290,7 +290,7 @@ impl AppUi {
             forced_passes: 1,
             browser_tex_id: window.browser_texture(),
             browser_viewport: (0, 0),
-            game_mode: false,
+            game_mode: true,
             game_mode_toast: None,
             game_mode_toast_text: String::new(),
             game_menu: GameMenu::new(),

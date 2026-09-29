@@ -5450,6 +5450,7 @@ dependencies = [
  "inputbind",
  "keyboard-types",
  "log",
+ "mime_guess",
  "openh264",
  "percent-encoding",
  "png",

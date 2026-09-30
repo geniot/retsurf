@@ -173,7 +173,6 @@ impl App {
         self.ui.update.auto_check(&self.event_sender);
         self.running = true;
         let mut commands = Vec::with_capacity(4);
-        self.enter_game_mode(&mut commands);
 
         while self.running {
             self.browser.pump_event_loop();

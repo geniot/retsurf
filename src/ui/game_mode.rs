@@ -3,7 +3,7 @@
 
 use super::{drop_egui_focus, AppUi};
 use egui_sdl2::egui;
-use std::time::{Duration};
+use std::time::{Duration, Instant};
 
 /// How long the Game Mode entry toast stays before fading.
 const GAME_MODE_TOAST: Duration = Duration::from_secs(4);
@@ -25,10 +25,10 @@ impl AppUi {
     /// Enter Game Mode, showing `toast` (worded by [`game_mode_toast_text`]).
     /// Dropping egui's keyboard focus is part of it: egui is offered every key
     /// before we are, so a focused address bar would go on eating them.
-    pub fn enter_game_mode(&mut self, _: String) {
+    pub fn enter_game_mode(&mut self, toast: String) {
         self.game_mode = true;
-        // self.game_mode_toast = Some(Instant::now());
-        // self.game_mode_toast_text = toast;
+        self.game_mode_toast = Some(Instant::now());
+        self.game_mode_toast_text = toast;
         drop_egui_focus(&self.egui_ctx);
     }
 

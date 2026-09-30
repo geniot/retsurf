@@ -6,6 +6,7 @@ use super::{AppUi, ChromeHidden, ToolbarLayout};
 use crate::browser::AppBrowser;
 use crate::config::ToolbarPosition;
 use crate::platform::window::AppWindow;
+use crate::ui::Focus;
 
 impl AppUi {
     /// Move the toolbar to a window edge (live config change).
@@ -83,15 +84,16 @@ impl AppUi {
     /// Decide the toolbar layout before the egui closure (these reads borrow all
     /// of `self`, which can't overlap `egui.run`). Auto-hide floats the bar: a
     /// strip that came and went would resize the web view, a full Servo reflow.
-    pub(super) fn toolbar_layout(&self, _: ChromeHidden) -> ToolbarLayout {
+    pub(super) fn toolbar_layout(&self, chrome_hidden: ChromeHidden) -> ToolbarLayout {
         // Game Mode is the exception: nothing it opens types into the chrome,
         // so an overlay of its own must not bring the bar back over the game.
-        // let typing = self.focus() != Focus::Page && !chrome_hidden.game_mode;
+        let typing = self.focus() != Focus::Page && !chrome_hidden.game_mode;
         ToolbarLayout {
             position: self.toolbar_position,
             // Typing still wins: auto-hide forces the bar up for a focused field,
             // and a hidden chrome must not leave an invisible address bar to type into.
-            shown: false, //typing || (!chrome_hidden.any() && (!self.toolbar_autohide || self.toolbar_shown)),
+            shown: typing
+                || (!chrome_hidden.any() && (!self.toolbar_autohide || self.toolbar_shown)),
             overlay: self.toolbar_autohide,
         }
     }

@@ -12,7 +12,6 @@ mod overlay;
 mod platform;
 mod ui;
 mod update;
-mod server;
 
 use crate::app::App;
 
@@ -27,10 +26,6 @@ const BUILD_ID: &str = concat!(
     env!("RETSURF_BUILD_DATE"),
     ")"
 );
-
-pub fn run_server() {
-    server::start_web_server();
-}
 
 /// Shared startup for the desktop and Android entry points. Everything
 /// platform-specific is `cfg`-gated here.
@@ -55,7 +50,7 @@ pub fn run_app() {
 
     let mut sdl = sdl2::init().unwrap();
     let app = App::new(&mut sdl, app_config).unwrap();
-    
+
     app.run();
 }
 

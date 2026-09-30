@@ -40,7 +40,7 @@ impl App {
 
     /// Enter Game Mode, closing whatever overlay is up: the point is that the
     /// page owns the input, and an overlay would still hold it.
-    pub fn enter_game_mode(&mut self, out: &mut Vec<AppCommand>) {
+    fn enter_game_mode(&mut self, out: &mut Vec<AppCommand>) {
         // The mode has nothing to route through without its maps, and this is
         // the one path in.
         self.game_mode();
@@ -105,9 +105,6 @@ impl App {
                     self.ui.game_menu.close();
                     self.enter_game_mode(out);
                 }
-            },
-            GameRow::Quit => {
-                self.shutdown();
             },
         }
     }

@@ -1,12 +1,12 @@
 //! Rendering of the built-in start page overlay (state lives in
-//! [`crate::overlay::home`]): a wordmark, a search / URL field, a speed-dial
-//! grid of the pinned shortcuts, and a bottom control-hint bar. Navigation is
-//! routed by [`crate::app`]; tiles open via [`MenuAction::OpenUrl`].
+//! [`crate::overlay::home`]): a brand mark (the banner scene, the wordmark, or
+//! none), a search / URL field and a speed-dial grid of the pinned shortcuts.
+//! Navigation is routed by [`crate::app`]; tiles open via [`MenuAction::OpenUrl`].
 
+use super::favicon::{Icon, PageIcons};
 use super::theme::{ACCENT, BG, BORDER, INK, MUTED, SURFACE, SURF_WARM};
 use super::OskCaret;
 use crate::command::{AppCommand, MenuAction};
-use crate::config::FaceLabels;
 use crate::data::dial::SETTINGS_PIN;
 use crate::overlay::home::Home;
 use egui_phosphor::bold;
@@ -19,6 +19,84 @@ use std::collections::HashMap;
 /// wordmark stays on Hack via [`add_wordmark`] regardless.
 fn font(size: f32) -> egui::FontId {
     egui::FontId::proportional(size)
+}
+
+/// The banner scene without its plate; the start page supplies the background.
+static BANNER_SVG: &[u8] = include_bytes!("../../resources/retsurf-banner-bare.svg");
+/// The banner's drawn height (logical px); its width follows the SVG's aspect.
+const BANNER_H: f32 = 100.0;
+/// Banner bottom to the search field; the scene's own sea is its margin.
+const BANNER_GAP: f32 = 12.0;
+/// The search field's top with no mark above it (logical px).
+const COMPACT_TOP: f32 = 16.0;
+
+/// What heads the start page.
+#[derive(Clone, Copy)]
+pub(super) enum Mark<'a> {
+    Banner(&'a egui::TextureHandle),
+    Wordmark,
+    None,
+}
+
+/// Everything the start page shows besides its own state.
+#[derive(Clone, Copy)]
+pub(super) struct HomeView<'a> {
+    pub pins: DialPins<'a>,
+    pub mark: Mark<'a>,
+}
+
+/// The banner rasterized for the current pixel density. It is drawn at one
+/// logical size, so a new rasterization is only needed when the scale changes.
+#[derive(Default)]
+pub(super) struct Banner {
+    texture: Option<(f32, egui::TextureHandle)>,
+    /// The SVG would not rasterize; not retried every frame.
+    failed: bool,
+}
+
+impl Banner {
+    pub fn texture(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
+        let ppp = ctx.pixels_per_point();
+        if self.failed {
+            return None;
+        }
+        if self.texture.as_ref().is_none_or(|(at, _)| *at != ppp) {
+            let Some(image) = rasterize_banner((BANNER_H * ppp).round() as u32) else {
+                log::warn!("start page: the banner SVG did not rasterize");
+                self.failed = true;
+                return None;
+            };
+            let texture = ctx.load_texture("home-banner", image, egui::TextureOptions::LINEAR);
+            self.texture = Some((ppp, texture));
+        }
+        self.texture.as_ref().map(|(_, t)| t)
+    }
+}
+
+/// [`BANNER_SVG`] at `height` px, its width to the SVG's aspect.
+fn rasterize_banner(height: u32) -> Option<egui::ColorImage> {
+    use resvg::{tiny_skia, usvg};
+    let tree = usvg::Tree::from_data(BANNER_SVG, &usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let scale = height as f32 / size.height();
+    let width = (size.width() * scale).round() as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+    Some(egui::ColorImage::from_rgba_premultiplied(
+        [width as usize, height as usize],
+        pixmap.data(),
+    ))
+}
+
+/// The pinned URLs with the site icons to draw them by.
+#[derive(Clone, Copy)]
+pub(super) struct DialPins<'a> {
+    pub urls: &'a [String],
+    pub icons: &'a PageIcons,
 }
 
 /// Tile footprint (logical px) and grid spacing. Shared with the dial editor.
@@ -38,11 +116,8 @@ const WAVE_AMP: f32 = WORDMARK_SIZE * 0.08; // crest height
 const WAVE_STROKE: f32 = WORDMARK_SIZE * 0.045;
 const WAVE_BAND: f32 = WAVE_GAP + WAVE_AMP + WAVE_STROKE;
 
-/// Hint bar geometry: centerline [`HINT_BASE`] off the page's foot, [`HINT_BAND`]
-/// the strip content must stay out of.
-const HINT_BASE: f32 = 18.0;
-const HINT_PILL_H: f32 = 18.0;
-const HINT_BAND: f32 = HINT_BASE + HINT_PILL_H / 2.0 + 8.0;
+/// Clearance between the page's foot and the scrolling dial.
+const FOOT: f32 = 12.0;
 
 /// Draw the start-page overlay over the (blank) web view, confined to the
 /// `webview` rect so the toolbar stays usable. Any activation is pushed as a
@@ -50,10 +125,9 @@ const HINT_BAND: f32 = HINT_BASE + HINT_PILL_H / 2.0 + 8.0;
 pub(super) fn add_home(
     ctx: &egui::Context,
     home: &mut Home,
-    pins: &[String],
+    view: HomeView,
     webview: egui::Rect,
     osk_caret: Option<OskCaret>,
-    face: FaceLabels,
     commands: &mut Vec<AppCommand>,
 ) {
     let area = webview;
@@ -85,18 +159,37 @@ pub(super) fn add_home(
                     const GAP_MID: f32 = 36.0; // field to grid
                     const GAP_TOP_RATIO: f32 = 0.6; // mark to field, of the mark's own height
 
-                    let mark_h = wordmark_height(ui);
-                    let gap_top = mark_h * GAP_TOP_RATIO;
-                    let head_h = mark_h + gap_top; // above the field
-
-                    // Content stops above the hint bar; the grid scrolls in what is
-                    // left, so a long dial can't hide rows off the page.
-                    let floor = area.bottom() - HINT_BAND;
-                    let top = ((floor - area.top()) * FIELD_ANCHOR - head_h).max(8.0);
+                    // The grid scrolls in what is left, so a long dial can't hide
+                    // rows off the page.
+                    let floor = area.bottom() - FOOT;
+                    let banner_size = |t: &egui::TextureHandle| {
+                        let size = t.size_vec2() * (BANNER_H / t.size_vec2().y);
+                        size * (area.width() / size.x).min(1.0)
+                    };
+                    let (mark_h, gap_top) = match view.mark {
+                        Mark::Banner(t) => (banner_size(t).y, BANNER_GAP),
+                        Mark::Wordmark => {
+                            let h = wordmark_height(ui);
+                            (h, h * GAP_TOP_RATIO)
+                        }
+                        Mark::None => (0.0, 0.0),
+                    };
+                    let top = match view.mark {
+                        Mark::None => COMPACT_TOP,
+                        Mark::Banner(_) | Mark::Wordmark => {
+                            ((floor - area.top()) * FIELD_ANCHOR - mark_h - gap_top).max(8.0)
+                        }
+                    };
 
                     ui.vertical_centered(|ui| {
                         ui.add_space(top);
-                        add_wordmark(ui);
+                        match view.mark {
+                            Mark::Banner(t) => {
+                                ui.add(egui::Image::new(t).fit_to_exact_size(banner_size(t)));
+                            }
+                            Mark::Wordmark => add_wordmark(ui),
+                            Mark::None => {}
+                        }
                         ui.add_space(gap_top);
                         add_search(ui, home, block_w, osk_caret);
                         ui.add_space(GAP_MID);
@@ -108,61 +201,12 @@ pub(super) fn add_home(
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
-                                    add_dial(ui, home, pins, block_w, cols, commands);
+                                    add_dial(ui, home, view.pins, block_w, cols, commands);
                                 });
                             });
                     });
-                    add_hint_bar(ui, area, face);
                 });
         });
-}
-
-/// The bottom control-hint bar: key-cap pills with their action. Painted rather
-/// than laid out in the flow, so the tile count can't move it.
-fn add_hint_bar(ui: &egui::Ui, area: egui::Rect, face: FaceLabels) {
-    let hints = [(face.a, "Open"), (bold::LIST, "Menu")];
-    const PAD: f32 = 6.0; // pill horizontal padding around the key glyph
-    const GAP_KL: f32 = 6.0; // key pill to its label
-    const GAP_SEG: f32 = 18.0; // between hint segments
-    let key_font = font(12.0);
-    let label_font = font(12.0);
-    let painter = ui.painter();
-
-    // Lay out every glyph first so the row can be centered as a whole.
-    let segs: Vec<_> = hints
-        .iter()
-        .map(|(key, label)| {
-            let kg = painter.layout_no_wrap(key.to_string(), key_font.clone(), INK);
-            let lg = painter.layout_no_wrap(label.to_string(), label_font.clone(), MUTED);
-            let pill_w = kg.size().x + PAD * 2.0;
-            let seg_w = pill_w + GAP_KL + lg.size().x;
-            (kg, lg, pill_w, seg_w)
-        })
-        .collect();
-    let total: f32 = segs.iter().map(|s| s.3).sum::<f32>() + GAP_SEG * (segs.len() - 1) as f32;
-
-    let cy = area.bottom() - HINT_BASE;
-    let mut x = area.center().x - total / 2.0;
-    for (kg, lg, pill_w, seg_w) in segs {
-        let pill = egui::Rect::from_min_size(
-            egui::pos2(x, cy - HINT_PILL_H / 2.0),
-            egui::vec2(pill_w, HINT_PILL_H),
-        );
-        painter.rect_filled(pill, 5.0, SURFACE);
-        painter.rect_stroke(
-            pill,
-            5.0,
-            egui::Stroke::new(1.0, BORDER),
-            egui::StrokeKind::Inside,
-        );
-        painter.galley(pill.center() - kg.size() / 2.0, kg, INK);
-        painter.galley(
-            egui::pos2(x + pill_w + GAP_KL, cy - lg.size().y / 2.0),
-            lg,
-            MUTED,
-        );
-        x += seg_w + GAP_SEG;
-    }
 }
 
 /// The brand wordmark: "ret" in ink, "surf" in the brand gradient. egui has no
@@ -323,16 +367,16 @@ pub(super) fn slot_count(pins: &[String]) -> usize {
 fn add_dial(
     ui: &mut egui::Ui,
     home: &Home,
-    pins: &[String],
+    pins: DialPins,
     width: f32,
     cols: usize,
     commands: &mut Vec<AppCommand>,
 ) {
-    tile_grid(ui, width, cols, slot_count(pins), |ui, i| {
+    tile_grid(ui, width, cols, slot_count(pins.urls), |ui, i| {
         let selected = home.tile() == Some(i);
-        match pins.get(i) {
+        match pins.urls.get(i) {
             Some(url) => {
-                if add_tile(ui, url, selected).clicked() {
+                if add_tile(ui, url, pins.icons.icon(url), selected).clicked() {
                     commands.push(AppCommand::Menu(MenuAction::OpenUrl(url.clone())));
                 }
             }
@@ -384,14 +428,21 @@ pub(super) fn tile_grid(
 
 /// Glyph-square side length within a tile.
 pub(super) const GLYPH: f32 = 52.0;
+/// A site icon inside the glyph square: near the 32 px cache, so it stays sharp.
+const DIAL_ICON: f32 = 34.0;
+/// How much of an icon's tint colours its glyph square over [`SURFACE`].
+const TINT_MIX: f32 = 0.35;
+/// Saturation and value of an iconless tile's fill; its hue comes from the label.
+const LETTER_SAT: f32 = 0.6;
+const LETTER_VAL: f32 = 0.42;
 
 /// One speed-dial tile: a rounded "glyph" square holding the brand initial, with
 /// the brand name beneath it. Custom-painted (not a Button) for the two-tier
 /// look.
-fn add_tile(ui: &mut egui::Ui, url: &str, selected: bool) -> egui::Response {
+fn add_tile(ui: &mut egui::Ui, url: &str, icon: Option<Icon>, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(TILE_W, TILE_H), egui::Sense::click());
     keep_visible(ui, &resp, rect, selected);
-    paint_tile(ui.painter(), rect, url, selected || resp.hovered());
+    paint_tile(ui.painter(), rect, url, icon, selected || resp.hovered());
     resp
 }
 
@@ -409,10 +460,24 @@ fn keep_visible(ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, selected
     }
 }
 
-/// Paint a speed-dial tile's visuals into `rect`; the caller owns the click
-/// region and any extra overlay.
-pub(super) fn paint_tile(painter: &egui::Painter, rect: egui::Rect, url: &str, active: bool) {
-    let glyph = paint_glyph_square(painter, rect, active, Some(SURFACE));
+/// Paint a speed-dial tile's visuals into `rect`: the site `icon` on a square
+/// tinted after it, else the initial; the caller owns the click region and any
+/// extra overlay.
+pub(super) fn paint_tile(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    url: &str,
+    icon: Option<Icon>,
+    active: bool,
+) {
+    let icon = icon.filter(|_| url != SETTINGS_PIN);
+    let fill = match icon {
+        Some(icon) if icon.dark => INK,
+        Some(icon) => SURFACE.lerp_to_gamma(icon.tint, TINT_MIX),
+        None if url == SETTINGS_PIN => SURFACE,
+        None => letter_fill(&brand_label(url)),
+    };
+    let glyph = paint_glyph_square(painter, rect, active, Some(fill));
 
     // The settings sentinel isn't a real address: show a gear glyph and "Settings"
     // rather than the garbage `brand_label` would derive from `retsurf:settings`.
@@ -427,13 +492,23 @@ pub(super) fn paint_tile(painter: &egui::Painter, rect: egui::Rect, url: &str, a
             .unwrap_or_default();
         (initial, label)
     };
-    painter.text(
-        glyph.center(),
-        egui::Align2::CENTER_CENTER,
-        glyph_text,
-        font(22.0),
-        INK,
-    );
+    match icon {
+        Some(Icon { bare: texture, .. }) => {
+            let fit = DIAL_ICON / texture.size_vec2().max_elem();
+            let at = egui::Rect::from_center_size(glyph.center(), texture.size_vec2() * fit);
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(texture.id(), at, uv, egui::Color32::WHITE);
+        }
+        None => {
+            painter.text(
+                glyph.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph_text,
+                font(22.0),
+                INK,
+            );
+        }
+    }
 
     // Brand name under the glyph (truncated so a long name can't overflow).
     painter.text(
@@ -443,6 +518,33 @@ pub(super) fn paint_tile(painter: &egui::Painter, rect: egui::Rect, url: &str, a
         font(12.0),
         if active { INK } else { MUTED },
     );
+}
+
+/// An iconless tile's fill: a hue hashed from `label`, so a site keeps its
+/// colour across runs and versions.
+fn letter_fill(label: &str) -> egui::Color32 {
+    // FNV-1a, 32-bit: stable, unlike std's hasher.
+    const OFFSET: u32 = 0x811c_9dc5;
+    const PRIME: u32 = 0x0100_0193;
+    // Evenly spaced hues, so two tiles differ clearly or match exactly.
+    const HUES: u32 = 10;
+    let mut hash = label
+        .bytes()
+        .fold(OFFSET, |h, b| (h ^ u32::from(b)).wrapping_mul(PRIME));
+    // murmur3's finalizer: FNV alone leaves short, similar labels on near hues.
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae35);
+    hash ^= hash >> 16;
+    let hue = (hash % HUES) as f32 / HUES as f32;
+    egui::ecolor::HsvaGamma {
+        h: hue,
+        s: LETTER_SAT,
+        v: LETTER_VAL,
+        a: 1.0,
+    }
+    .into()
 }
 
 /// The rounded glyph square at a tile's top. `None` leaves it unfilled, for an

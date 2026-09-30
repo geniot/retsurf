@@ -12,14 +12,18 @@ use crate::config::AppConfig;
 use crate::overlay::dial_edit::EditItem;
 use crate::overlay::menu::Section;
 use crate::overlay::osk::OskCommand;
-use crate::overlay::settings::Task;
+use crate::overlay::settings::{Door, Task};
 use crate::ui::Focus;
 
 impl App {
     pub(super) fn execute_command(&mut self, command: &AppCommand, out: &mut Vec<AppCommand>) {
         // Game Mode shrinks the vocabulary to its own, so a shortcut resolved
         // under one of its overlays cannot act on the browser behind it.
-        if (self.ui.game_mode() || self.ui.game_screen()) && !command.in_game_mode() {
+        let settings_up = self.ui.settings.visible() && command.keeps_the_page();
+        if (self.browser.in_game_mode() || self.ui.game_screen())
+            && !command.in_game_mode()
+            && !settings_up
+        {
             return;
         }
         match command {
@@ -37,9 +41,11 @@ impl App {
             AppCommand::Menu(action) => self.menu_action(action),
             AppCommand::ToggleBookmark => self.toggle_current_bookmark(),
             AppCommand::FocusAddressBar => self.focus_address_bar(out),
-            AppCommand::CloseTab => self.close_tab_at(self.browser.active_tab()),
-            AppCommand::GameMode => self.game_mode_gesture(),
-            AppCommand::GameMenu(action) => self.game_menu_action(action, out),
+            AppCommand::CloseTab => {
+                self.close_tab_at(self.browser.active_tab());
+                self.ui.toast("Tab closed");
+            }
+            AppCommand::QuickAccess(action) => self.quick_access_action(action, out),
             AppCommand::GameInputMaps(action) => self.input_maps_action(action, out),
             AppCommand::GameMapEdit(action) => self.map_edit_action(action, out),
             AppCommand::Prompt(action) => match action {
@@ -83,7 +89,7 @@ impl App {
             MenuAction::RemoveSelected => self.delete_menu_selection(),
             MenuAction::Clear => self.ui.menu.clear_or_arm(),
             MenuAction::OpenUrl(url) => self.open_url(url.clone()),
-            MenuAction::ToggleBookmark(url) => self.ui.menu.toggle_bookmark(url),
+            MenuAction::ToggleBookmark(url) => self.toggle_bookmark(url),
             MenuAction::DialEdit => self.ui.dial_edit.open(),
             MenuAction::DialClose => self.ui.dial_edit.close(),
             MenuAction::DialAdd(url) => self.dial_add(url),
@@ -128,8 +134,18 @@ impl App {
     fn toggle_current_bookmark(&mut self) {
         let url = self.browser.state().page_url().to_string();
         if !url.is_empty() {
-            self.ui.menu.toggle_bookmark(&url);
+            self.toggle_bookmark(&url);
         }
+    }
+
+    fn toggle_bookmark(&mut self, url: &str) {
+        self.ui.menu.toggle_bookmark(url);
+        let saved = self.ui.menu.is_bookmarked(url);
+        self.ui.toast(if saved {
+            "Bookmarked"
+        } else {
+            "Bookmark removed"
+        });
     }
 
     /// Open the highlighted menu entry (the **A** button / Enter). In Tabs this
@@ -172,18 +188,24 @@ impl App {
             Section::Bookmarks => {
                 if let Some(url) = self.ui.menu.selected_url() {
                     self.ui.menu.dial.toggle(&url);
+                    let pinned = self.ui.menu.dial.contains(&url);
+                    self.ui.toast(if pinned {
+                        "Pinned to speed dial"
+                    } else {
+                        "Unpinned from speed dial"
+                    });
                 }
             }
             Section::History => {
                 if let Some(url) = self.ui.menu.selected_url() {
-                    self.ui.menu.toggle_bookmark(&url);
+                    self.toggle_bookmark(&url);
                 }
             }
             Section::Tabs => {
                 if let Some(index) = self.selected_tab_index() {
                     if let Some(info) = self.browser.tabs().get(index) {
                         if !info.url.is_empty() {
-                            self.ui.menu.toggle_bookmark(&info.url);
+                            self.toggle_bookmark(&info.url);
                         }
                     }
                 }
@@ -200,7 +222,7 @@ impl App {
                 if self.ui.settings.visible() {
                     self.settings_close(out);
                 } else {
-                    self.ui.settings_open(&self.config);
+                    self.open_settings(None);
                 }
             }
             SettingsAction::Close => self.settings_close(out),
@@ -214,7 +236,7 @@ impl App {
                 self.settings_close(out);
                 self.open_url(url.clone());
             }
-            // Binding capture (Controls section): the gesture performed, bound
+            // Binding capture (the binding list): the gesture performed, bound
             // to the listening action. The raw input comes from the event loop.
             SettingsAction::CaptureBinding { gesture, keyboard } => {
                 self.ui.settings.apply_capture(gesture.clone(), *keyboard);
@@ -238,9 +260,8 @@ impl App {
         }
     }
 
-    /// A / Enter on the focused settings row: add/remove a binding in the Controls
-    /// section, run a confirmed action row, open the on-screen keyboard on a text
-    /// field, or step every other kind forward (Left/Right does the rest).
+    /// A / Enter on the focused settings row, by its kind; a value steps forward
+    /// (Left/Right does the rest).
     pub(super) fn settings_confirm(&mut self, out: &mut Vec<AppCommand>) {
         if self.ui.settings.is_info_section() {
             // About tab: A activates the focused row (update action or a link);
@@ -248,8 +269,12 @@ impl App {
             if let Some(action) = self.ui.about_activate() {
                 out.push(AppCommand::Settings(action));
             }
-        } else if self.ui.settings.is_controls_section() {
+        } else if self.ui.settings.bindings_open() {
             self.ui.settings.controls_activate();
+        } else if let Some(door) = self.ui.settings.open_door() {
+            if door == Door::InputMaps {
+                self.open_input_maps();
+            }
         } else if let Some(task) = self.ui.settings.confirm_action() {
             match task {
                 Task::ClearData => self.clear_browsing_data(),
@@ -262,15 +287,17 @@ impl App {
         }
     }
 
-    /// Wipe the browsing data: history, the finished downloads, the saved
-    /// session and the open tabs, plus Servo's cookies, web storage and HTTP
-    /// cache. Bookmarks, pins and the settings stay.
+    /// Wipe the browsing data: history, the icons only it referenced, the
+    /// finished downloads, the saved session and the open tabs, plus Servo's
+    /// cookies, web storage and HTTP cache. Bookmarks, pins and the settings stay.
     fn clear_browsing_data(&mut self) {
         self.ui.menu.history_mut().clear();
+        crate::data::page_icons::prune(&self.ui.menu.icon_hosts(false));
         self.ui.menu.downloads.clear_finished();
         self.session.discard();
         self.browser.clear_site_data();
         self.browser.reset_tabs(&self.config.browser.home_page);
+        self.ui.toast("Browsing data cleared");
         log::info!("cleared browsing data");
     }
 
@@ -280,6 +307,7 @@ impl App {
     fn restore_defaults(&mut self) {
         self.ui.settings.restore_defaults();
         self.ui.menu.dial.reset();
+        self.ui.toast("Defaults restored");
         log::info!("restored default settings, bindings and pins");
     }
 
@@ -313,20 +341,27 @@ impl App {
         // Restoring the defaults can move the pad map under a live Game
         // Mode, so push it the same way the menu does.
         self.adopt_input_map(out);
+        let scaling = match self.browser.in_game_mode() {
+            true => self.config.game_mode.view.scaling,
+            false => crate::config::Scaling::Off,
+        };
+        self.browser.set_game_scaling(scaling);
         // The router reads cursor/scroll speeds from the config each frame, but
         // the gamepad state machine and the UI cache a few values to push in.
         self.event_handler
-            .set_gamepad_config(self.config.input.clone());
+            .set_gamepad_config(self.config.controls.clone());
         self.ui
-            .set_cursor_linger(self.config.display.cursor_linger_ms);
-        self.ui.set_ui_scale(self.config.display.scale);
+            .set_cursor_linger(self.config.interface.cursor_linger_ms);
+        self.ui.set_ui_scale(self.config.interface.scale);
         self.ui
-            .set_toolbar_position(self.config.display.toolbar_position);
+            .set_toolbar_position(self.config.interface.toolbar_position);
         self.ui
-            .set_toolbar_autohide(self.config.display.toolbar_autohide);
-        self.ui.set_hint_badges(self.config.input.hint_badges);
+            .set_toolbar_autohide(self.config.interface.toolbar_autohide);
+        self.ui.set_hint_badges(self.config.controls.hint_badges);
+        self.ui.set_page_icons(self.config.interface.page_icons);
+        self.ui.set_home_style(self.config.interface.home_style);
         self.ui.set_osk_style(self.config.osk.style);
-        self.ui.set_pad_layout(self.config.input.pad_layout);
+        self.ui.set_pad_layout(self.config.controls.pad_layout);
         self.ui.menu.history_mut().set_config(&self.config.history);
         self.ui.set_memory_debug(
             self.config.debug.memory_overlay,
@@ -334,6 +369,8 @@ impl App {
         );
         self.ui.update.set_config(&self.config.update);
         self.browser.apply_config(&self.config);
+        self.ui.menu.downloads.user_agent =
+            crate::browser::effective_user_agent(&self.config.browser);
         // Off drops the stored session now, not on the next launch.
         if !self.config.browser.restore_tabs {
             self.session.discard();
@@ -342,7 +379,7 @@ impl App {
             .set_enabled(self.config.performance.cpu_boost_on_load);
         // The frame cap takes effect on the very next frame, which is what makes
         // it worth tuning by hand on a device.
-        self.window.set_max_fps(self.config.display.max_fps);
+        self.window.set_max_fps(self.config.performance.max_fps);
     }
 
     /// Put the caret where an address is typed, over the page or the start page

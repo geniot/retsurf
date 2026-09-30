@@ -4,7 +4,7 @@
 //! ad-block hook over every resource load (see [`crate::browser::adblock`]). New
 //! delegate hooks (favicons, dialogs, notifications, …) belong in this file.
 
-use super::{AppBrowserInner, BrowserState, Tab};
+use super::{AppBrowserInner, BrowserState, Favicon, Tab, TabMode};
 use crate::event::user::UserEvent;
 use content_security_policy::Destination;
 use servo::WebView;
@@ -74,6 +74,26 @@ impl servo::WebViewDelegate for AppBrowserInner {
                 ));
             }
         }
+    }
+
+    fn notify_favicon_changed(&self, webview: WebView) {
+        if !self.page_icons.get() {
+            return;
+        }
+        let Some(i) = self.tab_index(webview.id()) else {
+            return;
+        };
+        let favicon = webview
+            .favicon()
+            .and_then(|image| Favicon::from_image(&image));
+        let mut tabs = self.tabs.borrow_mut();
+        if let Some(icon) = &favicon {
+            self.new_icons
+                .push((tabs[i].state.page_url.clone(), icon.clone()));
+        }
+        tabs[i].favicon = favicon;
+        drop(tabs);
+        self.event_sender.send(UserEvent::BrowserFrameReady);
     }
 
     /// Without this Servo answers `screen.width`, `availWidth` and `outerWidth`
@@ -146,6 +166,9 @@ impl servo::WebViewDelegate for AppBrowserInner {
         let replaces = self.max_tabs.get() == 1;
         if !replaces && !self.has_tab_room() {
             log::warn!("tab cap reached: declined a page-opened tab");
+            self.notices.push(super::BrowserNotice::PopupRefused {
+                cap: self.max_tabs.get(),
+            });
             return;
         }
         let webview = self.build_webview(
@@ -154,6 +177,11 @@ impl servo::WebViewDelegate for AppBrowserInner {
             parent_webview.gamepad_delegate(),
         );
 
+        // A game's popup stays in the game; a reader view is the opener's own.
+        let mode = match self.tab_index(parent_webview.id()) {
+            Some(i) if self.tabs.borrow()[i].state.mode == TabMode::Game => TabMode::Game,
+            _ => TabMode::Page,
+        };
         // Dropping a `WebView` closes it in Servo, so the tab it replaces goes
         // with it rather than lingering behind the cap.
         if replaces {
@@ -161,8 +189,12 @@ impl servo::WebViewDelegate for AppBrowserInner {
         }
         self.adopt_tab(Tab {
             webview,
-            state: BrowserState::default(),
+            state: BrowserState {
+                mode,
+                ..BrowserState::default()
+            },
             page_images: RefCell::default(),
+            favicon: None,
         });
         self.event_sender.send(UserEvent::BrowserFrameReady);
     }
@@ -173,6 +205,12 @@ impl servo::WebViewDelegate for AppBrowserInner {
     fn load_web_resource(&self, webview: WebView, load: servo::WebResourceLoad) {
         let req = load.request();
         let url = req.url.clone();
+
+        // Ahead of adblock and the image cap.
+        if let Some(site) = self.local_site.as_ref().filter(|site| site.owns(&url)) {
+            site.serve(load);
+            return;
+        }
 
         // The injected capture script signals a waiting file by loading this URL,
         // which names no real host; the bytes come back over `evaluate_javascript`.
@@ -194,16 +232,20 @@ impl servo::WebViewDelegate for AppBrowserInner {
         // Per-page image cap: Servo loads every image eagerly, and a huge grid
         // freezes the device. Counted per distinct image, not per element.
         if let Some(i) = self.tab_index(webview.id()) {
-            let tabs = self.tabs.borrow();
-            let images = &tabs[i].page_images;
             if req.is_for_main_frame {
-                images.borrow_mut().clear();
+                let tab = &mut self.tabs.borrow_mut()[i];
+                tab.page_images.get_mut().clear();
+                tab.favicon = None;
+                if tab.state.mode == TabMode::Reader {
+                    tab.state.mode = TabMode::Page;
+                }
             } else if is_subresource && !block && req.destination == Destination::Image {
                 if let Some(cap) = filter.image_cap() {
-                    if !images
-                        .borrow_mut()
-                        .allow(&url, req.referrer_url.as_ref(), cap)
-                    {
+                    if !self.tabs.borrow()[i].page_images.borrow_mut().allow(
+                        &url,
+                        req.referrer_url.as_ref(),
+                        cap,
+                    ) {
                         log::debug!("image cap: blocked {url}");
                         block = true;
                     }
@@ -258,7 +300,7 @@ pub(super) fn referer_for(location: &str) -> Option<String> {
 /// Answer an intercepted load with `body`, always sending a chunk — even an
 /// empty one. Servo marks a body `Done` only once a chunk arrived, and net's
 /// subresource-integrity check panics on a body that isn't.
-fn finish_intercepted(
+pub(super) fn finish_intercepted(
     load: servo::WebResourceLoad,
     response: servo::WebResourceResponse,
     body: Vec<u8>,

@@ -9,39 +9,39 @@
   <a href="https://github.com/mxmgorin/retsurf/actions/workflows/check.yml"><img src="https://img.shields.io/github/actions/workflow/status/mxmgorin/retsurf/check.yml?branch=main&style=flat-square&labelColor=16171a&color=3fb8a0&logo=githubactions&logoColor=white&label=ci&cacheSeconds=180" alt="CI"></a>
 </div>
 
-retsurf is a web browser written in Rust and built with [Servo](https://servo.org/) and [SDL2](https://www.libsdl.org/). It aims to provide a full-featured web experience while staying lightweight and portable. It targets handheld devices while also working on Android and desktops, with gamepad- and keyboard-friendly controls for browsing and gaming-specific features like remappable input.
+retsurf is a web browser written in Rust and built with [Servo](https://servo.org/) and [SDL2](https://www.libsdl.org/). It aims to provide a full-featured web experience while staying lightweight and portable. It targets handheld devices while also working on Android and desktops. It has gamepad- and keyboard-friendly controls for browsing and gaming-specific features like remappable input.
 
 **[Install](#install)** on a PortMaster handheld, a Miyoo Mini, Android, Linux, Windows, or macOS.
 
 > **Work in progress.** Early development — expect bugs.
 
-## Demos
-
-| Powkiddy RGB30 | Miyoo Mini Flip |
-|:---:|:---:|
-| <img src="resources/images/retsurf-demo-rgb30.webp" alt="retsurf held in both hands on a Powkiddy RGB30, scrolling an image-heavy news site" height="250"> | <img src="resources/images/retsurf-demo-miyoo-mini-flip.webp" alt="retsurf on a Miyoo Mini Flip, scrolling servo.org with the D-pad" height="250"> |
-| <sub>OpenGL ES</sub> | <sub>`software` build, no GPU</sub> |
-
 ## Screenshots
 
 | Start page | Browsing | Link hints | Keyboard |
 |:---:|:---:|:---:|:---:|
-| ![The built-in start page: a search field over a speed-dial grid of pinned sites](resources/images/retsurf-start-page.png) | ![Hacker News rendered by Servo in its mobile layout, the toolbar above it](resources/images/retsurf-page.png) | ![Vimium-style hints over a Wikipedia article, each link labeled with the gamepad buttons that open it](resources/images/retsurf-hints.png) | ![The on-screen keyboard raised under the start page's search field, which shows what has been typed](resources/images/retsurf-keyboard.png) |
+| ![The built-in start page: the retsurf banner over a search field and a speed-dial grid of pinned sites, tinted after their site icons](resources/images/retsurf-start-page.png) | ![Hacker News rendered by Servo in its mobile layout, the toolbar above it](resources/images/retsurf-page.png) | ![Vimium-style hints over a Wikipedia article, each link labeled with the gamepad buttons that open it](resources/images/retsurf-hints.png) | ![The on-screen keyboard raised under the start page's search field, which shows what has been typed](resources/images/retsurf-keyboard.png) |
 
-| Tabs | Downloads | Reader mode | Settings |
+| Quick Access | Quick Menu | Reader view | Settings |
 |:---:|:---:|:---:|:---:|
-| ![The menu's Tabs section: open tabs by title, each with a bookmark and close button](resources/images/retsurf-tabs.png) | ![The Downloads section: one file downloading with percentage and size, one finished](resources/images/retsurf-downloads.png) | ![A Wikipedia article stripped to its text by reader mode](resources/images/retsurf-reader.png) | ![The settings overlay on its Browser tab: home page, search URL, user agent, zoom, theme and the experimental web features](resources/images/retsurf-settings.png) |
+| ![Quick Access at the right edge over Hacker News: enter game mode, enter reader view, bookmark, page theme](resources/images/retsurf-quick-access.png) | ![Quick Menu at the left edge: home, tabs, bookmarks, history, downloads, settings and quit](resources/images/retsurf-quick-menu.png) | ![A Wikipedia article stripped to its text by reader view](resources/images/retsurf-reader.png) | ![The settings overlay on its Browser tab: home page, search URL, user agent, zoom, theme and the experimental web features](resources/images/retsurf-settings.png) |
+
+| Game mode | Input map | Controls | Forced dark |
+|:---:|:---:|:---:|:---:|
+| ![Quick Access over the WebGL racer HexGL mid-race, the browser chrome hidden: view, the input map in use, the on-screen keyboard and exit](resources/images/retsurf-game-mode.png) | ![The input map editor: each stick direction and gamepad button with the key or mouse action it sends to the game](resources/images/retsurf-input-map.png) | ![The button bindings: each browser action with its gamepad and keyboard gestures](resources/images/retsurf-controls.png) | ![Lobsters, a light site with no dark theme, inverted by forced dark](resources/images/retsurf-forced-dark.png) |
 
 ## Features
 
 - **Gamepad-first navigation**<br>
-  The browser is fully navigable with a gamepad or keyboard, with a virtual cursor, Vimium-style link hints, and an on-screen keyboard (QWERTY + ЙЦУКЕН).
+  The browser is fully navigable with a gamepad or keyboard, with a virtual cursor, Vimium-style link hints, and an on-screen keyboard as a grid or a wheel.
 
 - **Customizable browser controls**<br>
   Every browser action can be rebound in-app, with support for tap, hold, and chord.
 
 - **Game mode**<br>
-  Hides the browser chrome and routes input to the page, with an in-app remapper that can rebind any button with multiple profiles.
+  Hides the browser chrome and routes input to the page, with an in-app editor for input maps that turn buttons and sticks into keys, mouse, or raw gamepad input.
+
+- **Web games**<br>
+  WebGL 2, the Gamepad API, Web Audio, and IndexedDB, plus compatibility shims that let Emscripten exports from itch.io run.
 
 - **Tabs, bookmarks, history, and downloads**<br>
   Everything lives in one full-screen menu. Downloads run in the background with progress and cancellation and a toolbar chip for active downloads.
@@ -49,7 +49,7 @@ retsurf is a web browser written in Rust and built with [Servo](https://servo.or
 - **Real page zoom**<br>
   Reflows the layout rather than simply magnifying it, with 50–300% zoom steps. Zoom is per-tab.
 
-- **Reader mode**<br>
+- **Reader view**<br>
   Strips pages down to their articles using Mozilla's [Readability](https://github.com/mozilla/readability). Runs in place, so it also works with logged-in and dynamically rendered pages.
 
 - **Dark web pages**<br>
@@ -99,6 +99,7 @@ Android, and the handheld cross-builds.
 
 Files are stored in the user data directory (`SDL_GetPrefPath`, e.g. `~/.local/share/mxmgorin/retsurf/` on Linux).
 Templates with the defaults are written on first run. See **[Configuration & bindings](docs/CONFIGURATION.md)** for all options and the bindings reference.
+
 ## How to help
 
 If you find the project useful, here is how you can help:
@@ -106,6 +107,7 @@ If you find the project useful, here is how you can help:
 - **Tell other people about it.** Sharing the project helps it reach more users.
 - **Report bugs and request features** in [Issues](https://github.com/mxmgorin/retsurf/issues). Feedback is welcome.
 - **Star the repo.** It helps the project get noticed and keeps me motivated.
+- **[Buy me a coffee](https://ko-fi.com/mxmgorin)** on Ko-fi.
 
 ## Credits
 
@@ -116,7 +118,7 @@ If you find the project useful, here is how you can help:
   [Phosphor](https://phosphoricons.com/)
 - Blocking by Brave's [adblock-rust](https://github.com/brave/adblock-rust), over
   [EasyList](https://easylist.to/) and EasyPrivacy
-- Reader mode by Mozilla's [Readability](https://github.com/mozilla/readability)
+- Reader view by Mozilla's [Readability](https://github.com/mozilla/readability)
 - Media by [Symphonia](https://github.com/pdeljanov/Symphonia) and
   [openh264](https://github.com/ralfbiedert/openh264-rs) over Cisco's codec
 - TLS by [rustls](https://github.com/rustls/rustls)

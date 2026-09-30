@@ -4,11 +4,11 @@
 //! A edit, B save & close — all of it without an analog stick.
 
 use super::panel::{self, center_selected, section_scroll, ROW_GAP, ROW_RADIUS, SIDES};
-use super::theme::{self, ACCENT, DIM, ROW_FONT, WARN};
+use super::theme::{self, ACCENT, DIM, HAIRLINE, ROW_FONT, WARN};
 use crate::command::{AppCommand, SettingsAction};
 use crate::config::FaceLabels;
 use crate::data::downloads::format_size;
-use crate::overlay::settings::{Settings, SettingsSection, RESET_ROWS};
+use crate::overlay::settings::{Door, Kind, Settings, SettingsSection, RESET_ROWS};
 use crate::update::{Offer, UpdateState};
 use egui_phosphor::bold;
 use egui_sdl2::egui;
@@ -20,6 +20,10 @@ const RESETS: [&str; RESET_ROWS] = ["Restore gamepad defaults", "Restore keyboar
 
 /// The square step buttons trailing a numeric row.
 const STEP_W: f32 = 26.0;
+/// An on/off switch's track (logical px); the knob is inset by `SWITCH_INSET`.
+const SWITCH_W: f32 = 34.0;
+const SWITCH_H: f32 = 18.0;
+const SWITCH_INSET: f32 = 3.0;
 
 /// The shared row shape (see [`panel::row`]), taking this file's owned strings.
 fn setting_row(
@@ -30,6 +34,29 @@ fn setting_row(
     value: String,
 ) -> egui::Response {
     panel::row(ui, width, selected, &label, &value)
+}
+
+/// An on/off switch at the trailing edge of `row`, where a value would sit.
+fn paint_switch(ui: &egui::Ui, row: egui::Rect, on: bool) {
+    let right = row.right() - ui.spacing().button_padding.x;
+    let track = egui::Rect::from_min_size(
+        egui::pos2(right - SWITCH_W, row.center().y - SWITCH_H / 2.0),
+        egui::vec2(SWITCH_W, SWITCH_H),
+    );
+    let (fill, knob_fill) = if on {
+        (ACCENT, egui::Color32::WHITE)
+    } else {
+        (HAIRLINE, DIM)
+    };
+    let painter = ui.painter();
+    painter.rect_filled(track, SWITCH_H / 2.0, fill);
+    let r = SWITCH_H / 2.0 - SWITCH_INSET;
+    let x = if on {
+        track.right() - SWITCH_H / 2.0
+    } else {
+        track.left() + SWITCH_H / 2.0
+    };
+    painter.circle_filled(egui::pos2(x, track.center().y), r, knob_fill);
 }
 
 /// A left/right step button for a numeric row, accent on the focused row.
@@ -405,12 +432,26 @@ fn add_controls(
     });
 }
 
+/// A settings tab's icon.
+fn section_icon(section: SettingsSection) -> &'static str {
+    match section {
+        SettingsSection::Browser => bold::GLOBE,
+        SettingsSection::Gaming => bold::GAME_CONTROLLER,
+        SettingsSection::Interface => bold::LAYOUT,
+        SettingsSection::Controls => bold::JOYSTICK,
+        SettingsSection::Content => bold::SHIELD_CHECK,
+        SettingsSection::System => bold::CPU,
+        SettingsSection::About => bold::INFO,
+    }
+}
+
 /// Draw the settings overlay: the section bar, a control hint, and the active
 /// section's field list. See the module docs for the controls.
 pub(super) fn add_settings(
     ctx: &egui::Context,
     settings: &Settings,
     update: &UpdateState,
+    input_map_name: &str,
     face: FaceLabels,
     commands: &mut Vec<AppCommand>,
 ) {
@@ -421,9 +462,10 @@ pub(super) fn add_settings(
         let clicked = panel::section_bar(
             ui,
             screen,
-            SettingsSection::ALL,
+            &SettingsSection::ALL,
             active,
             SettingsSection::label,
+            section_icon,
             |_| {},
         );
         if let Some(section) = clicked {
@@ -442,12 +484,12 @@ pub(super) fn add_settings(
                 &format!("{ok} select"),
                 &format!("{back} back"),
             ])
-        } else if settings.is_controls_section() {
+        } else if settings.bindings_open() {
             theme::hint_line(&[
                 section,
                 &mv,
                 &format!("{ok} open / bind / remove"),
-                &format!("{back} save & back"),
+                &format!("{back} back"),
             ])
         } else {
             theme::hint_line(&[
@@ -471,8 +513,8 @@ pub(super) fn add_settings(
             return;
         }
 
-        // Controls is a dynamic binding list, not FIELDS.
-        if settings.is_controls_section() {
+        // The binding list is dynamic, not FIELDS.
+        if settings.bindings_open() {
             add_controls(ui, settings, screen, commands);
             return;
         }
@@ -493,7 +535,7 @@ pub(super) fn add_settings(
             ui.spacing_mut().item_spacing.y = ROW_GAP;
             let mut last_cat = "";
             for (i, field) in rows {
-                if multi_cat && field.cat != last_cat {
+                if multi_cat && field.cat != last_cat && !field.cat.is_empty() {
                     last_cat = field.cat;
                     ui.add_space(6.0);
                     ui.label(
@@ -510,12 +552,31 @@ pub(super) fn add_settings(
                 } else {
                     field.label.to_string()
                 };
-                let value = settings.value_str(i);
+                let flag = settings.flag(i);
+                let value = match (flag, &field.kind) {
+                    (Some(_), _) => String::new(),
+                    (
+                        None,
+                        Kind::Door {
+                            door: Door::Bindings,
+                        },
+                    ) => bold::CARET_RIGHT.to_string(),
+                    (
+                        None,
+                        Kind::Door {
+                            door: Door::InputMaps,
+                        },
+                    ) => input_map_name.to_string(),
+                    (None, _) => settings.value_str(i),
+                };
                 let steppable = settings.is_steppable(i);
 
                 ui.horizontal(|ui| {
                     let row_w = if steppable { num_w } else { full_w };
                     let resp = setting_row(ui, row_w, selected, label, value);
+                    if let Some(on) = flag {
+                        paint_switch(ui, resp.rect, on);
+                    }
                     // Keep the focused row in view — no cursor to drag the bar.
                     if selected {
                         center_selected(&resp);

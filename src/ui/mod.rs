@@ -5,6 +5,7 @@
 mod chrome;
 mod cursor;
 mod dial_edit;
+mod favicon;
 mod game;
 mod game_mode;
 mod hints;
@@ -15,30 +16,34 @@ mod osk;
 mod overlays;
 mod panel;
 mod prompt;
+mod quick_access;
 mod scale;
 mod settings;
 mod theme;
+mod toast;
 mod toolbar;
 
 pub use self::game_mode::game_mode_toast_text;
 pub use self::overlays::Focus;
+pub use self::toast::notice_text;
 
 use crate::{
-    browser::AppBrowser,
+    browser::{AppBrowser, Favicon},
     command::AppCommand,
     config::{
-        DebugConfig, DisplayConfig, DownloadsConfig, HistoryConfig, InputConfig, OskConfig,
-        PadLayout, ToolbarPosition, UpdateConfig,
+        ControlsConfig, DebugConfig, DownloadsConfig, HistoryConfig, HomeStyle, InterfaceConfig,
+        OskConfig, PadLayout, ToolbarPosition, UpdateConfig,
     },
+    data::session::TabInfo,
     overlay::dial_edit::DialEdit,
     overlay::game::input_maps::InputMaps,
     overlay::game::map_edit::MapEdit,
-    overlay::game::menu::GameMenu,
     overlay::hints::Hints,
     overlay::home::Home,
-    overlay::menu::Menu,
+    overlay::menu::{Menu, Section},
     overlay::osk::Osk,
     overlay::prompt::Prompt,
+    overlay::quick_access::QuickAccess,
     overlay::settings::Settings,
     platform::window::AppWindow,
     update::{UpdateState, Updater},
@@ -138,11 +143,42 @@ struct FrameInputs {
     /// Page-zoom chip percentage (`None` at the default zoom).
     zoom_pct: Option<u16>,
     /// Tab snapshots for the menu's Tabs section (empty unless the menu is open).
-    tab_infos: Vec<crate::data::session::TabInfo>,
+    tab_infos: Vec<TabInfo>,
     osk_field: OskField,
     /// Where the OSK's caret sits, mirrored into each `TextEdit`.
     osk_caret: OskCaret,
     chrome_hidden: ChromeHidden,
+}
+
+/// The sites whose icons this frame draws: the menu's current section and the
+/// speed dial when `dial_shown`, each tab with its live icon.
+fn page_icon_wants<'a>(
+    menu: &'a Menu,
+    dial_shown: bool,
+    tabs: &'a [TabInfo],
+) -> Vec<(&'a str, Option<&'a Favicon>)> {
+    let mut wanted = Vec::new();
+    if menu.visible {
+        match menu.section() {
+            Section::Tabs => {
+                wanted.extend(tabs.iter().map(|t| (t.url.as_str(), t.favicon.as_ref())))
+            }
+            Section::Bookmarks => {
+                wanted.extend(menu.bookmarks().urls().iter().map(|u| (u.as_str(), None)))
+            }
+            Section::History => wanted.extend(
+                menu.history()
+                    .entries()
+                    .iter()
+                    .map(|e| (e.url.as_str(), None)),
+            ),
+            Section::Downloads => {}
+        }
+    }
+    if dial_shown {
+        wanted.extend(menu.dial.urls().iter().map(|u| (u.as_str(), None)));
+    }
+    wanted
 }
 
 /// The reasons the chrome hides, kept apart so leaving one does not reveal the
@@ -187,21 +223,15 @@ pub struct AppUi {
     browser_tex_id: Option<egui::TextureId>,
     /// Last browser viewport size (physical px) we requested, to avoid churn.
     browser_viewport: (u32, u32),
-    /// Game Mode: the browser stops consuming input and the chrome hides.
-    /// [`crate::event::keyboard`] reads it to forward a key instead of binding it.
-    game_mode: bool,
-    /// When Game Mode was entered; the chrome hides with nothing else on screen,
-    /// so a toast names the way out for [`GAME_MODE_TOAST`], then fades.
-    game_mode_toast: Option<Instant>,
-    /// Worded at entry from the ways out this device has.
-    game_mode_toast_text: String,
-    /// Game Mode's own menu (the `game_mode` gesture).
-    pub game_menu: GameMenu,
-    /// Its map list and one map's rows, opened from that menu.
+    /// The notice on screen, if any (see [`toast`]).
+    toast: Option<toast::Toast>,
+    /// The edge strips, Quick Access and Quick Menu.
+    pub quick_access: QuickAccess,
+    /// Game Mode's map list and one map's rows.
     pub input_maps: InputMaps,
     /// Its map editor, opened from a map.
     pub map_edit: MapEdit,
-    /// The live map's name, for the menu's row. Empty until that menu opens:
+    /// The live map's name, for the Gaming tab's row. Empty until Settings opens:
     /// naming it earlier would load every map for a row nobody has asked for.
     input_map_name: String,
     /// Gamepad cursor position (logical px). The UI owns it — it draws the
@@ -212,7 +242,7 @@ pub struct AppUi {
     cursor_last_move: Option<Instant>,
     /// How long the cursor stays visible after a move (from the interface config).
     cursor_linger: Duration,
-    /// `[display] scale`: the user's factor over the fit to the panel.
+    /// `[interface] scale`: the user's factor over the fit to the panel.
     ui_scale: f32,
     /// `RETSURF_SCALE`, standing in for the panel's own fit where a launcher
     /// knows better (Android, which reports a density a resolution cannot).
@@ -240,6 +270,11 @@ pub struct AppUi {
     /// Whether the active tab is on the start page (mirrored each frame from
     /// [`crate::browser::AppBrowser::on_home_page`]); drives [`Focus::Home`].
     home_active: bool,
+    /// `[interface] home_style`, and the banner it may draw, rasterized on first use.
+    home_style: HomeStyle,
+    banner: home::Banner,
+    /// Site icons for whichever lists are on screen (see [`page_icon_wants`]).
+    page_icons: favicon::PageIcons,
     /// Link-hint navigation state; the rects come from the browser.
     pub hints: Hints,
     /// Modal page prompts: queued `<select>` pickers and JS dialogs.
@@ -269,11 +304,11 @@ impl AppUi {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         window: &AppWindow,
-        display: &DisplayConfig,
+        interface: &InterfaceConfig,
         history: &HistoryConfig,
         downloads: &DownloadsConfig,
         osk: &OskConfig,
-        input: &InputConfig,
+        controls: &ControlsConfig,
         debug: &DebugConfig,
         update: &UpdateConfig,
         user_agent: String,
@@ -290,10 +325,8 @@ impl AppUi {
             forced_passes: 1,
             browser_tex_id: window.browser_texture(),
             browser_viewport: (0, 0),
-            game_mode: false,
-            game_mode_toast: None,
-            game_mode_toast_text: String::new(),
-            game_menu: GameMenu::new(),
+            toast: None,
+            quick_access: QuickAccess::new(),
             input_maps: InputMaps::new(),
             map_edit: MapEdit::new(),
             input_map_name: String::new(),
@@ -304,26 +337,29 @@ impl AppUi {
                 (w as f32 / ppp / 2.0, h as f32 / ppp / 2.0)
             },
             cursor_last_move: None,
-            cursor_linger: Duration::from_millis(display.cursor_linger_ms),
-            ui_scale: display.scale,
+            cursor_linger: Duration::from_millis(interface.cursor_linger_ms),
+            ui_scale: interface.scale,
             forced_scale: crate::config::device_scale(),
-            toolbar_position: display.toolbar_position,
-            toolbar_autohide: display.toolbar_autohide,
+            toolbar_position: interface.toolbar_position,
+            toolbar_autohide: interface.toolbar_autohide,
             toolbar_shown: true,
             scroll_accum: 0.0,
-            osk: Osk::new(osk, input.pad_layout),
+            osk: Osk::new(osk, controls.pad_layout),
             menu: Menu::new(history, downloads, user_agent),
             settings: Settings::new(),
             update: Updater::new(update),
             home: Home::new(),
             dial_edit: DialEdit::new(),
             home_active: false,
+            page_icons: favicon::PageIcons::new(interface.page_icons),
+            home_style: interface.home_style,
+            banner: home::Banner::default(),
             hints: Hints::new(),
             prompt: Prompt::new(),
             scroll_mode: false,
             edge_scroll: (0, 0),
-            hint_badges: input.hint_badges,
-            pad_layout: input.pad_layout,
+            hint_badges: controls.hint_badges,
+            pad_layout: controls.pad_layout,
             last_input_keyboard: false,
             memory_overlay: debug.memory_overlay,
             memory_log: debug.memory_log,
@@ -455,9 +491,12 @@ impl AppUi {
             let tick = Duration::from_secs(1);
             self.repaint_delay = Some(self.repaint_delay.map_or(tick, |d| d.min(tick)));
         }
-        // The Game Mode toast needs one wake at its expiry to be erased.
+        // A toast needs one wake at its expiry to be erased.
         if let Some(left) = self.toast_visible_for() {
             self.repaint_delay = Some(self.repaint_delay.map_or(left, |d| d.min(left)));
+        }
+        if self.take_fresh_toast() {
+            self.request_repaint();
         }
     }
 
@@ -481,9 +520,20 @@ impl AppUi {
             osk_caret: self.osk.caret(),
             chrome_hidden: ChromeHidden {
                 page_fullscreen: browser.is_fullscreen(),
-                game_mode: self.game_mode,
+                game_mode: browser.in_game_mode(),
             },
         }
+    }
+
+    /// `[interface] home_style`, applied live.
+    #[inline]
+    pub fn set_home_style(&mut self, style: HomeStyle) {
+        self.home_style = style;
+    }
+
+    /// `[interface] page_icons`, applied live; off frees every icon texture.
+    pub fn set_page_icons(&mut self, on: bool) {
+        self.page_icons.set_enabled(on);
     }
 
     /// Keep the start-page / dial-editor selections in range before they render.
@@ -563,7 +613,6 @@ impl AppUi {
                 root.set_clip_rect(ctx.content_rect());
 
                 let inputs = toolbar::ToolbarInputs {
-                    bookmarked: self.menu.is_bookmarked(&state.location),
                     tab_count,
                     active_downloads: self.menu.downloads.active_count(),
                     update_available,
@@ -632,16 +681,31 @@ impl AppUi {
                     }
                 }
 
+                let dial_shown = self.home_active || self.dial_edit.visible();
+                let wanted = page_icon_wants(&self.menu, dial_shown, &tab_infos);
+                self.page_icons.sync(ctx, wanted);
+
                 // A backdrop over the blank web view, below the foreground
                 // overlays; the dial editor covers it entirely.
                 if self.home_active && !self.dial_edit.visible() {
+                    let mark = match self.home_style {
+                        HomeStyle::Banner => self
+                            .banner
+                            .texture(ctx)
+                            .map_or(home::Mark::Wordmark, home::Mark::Banner),
+                        HomeStyle::Wordmark => home::Mark::Wordmark,
+                        HomeStyle::Compact => home::Mark::None,
+                    };
+                    let pins = home::DialPins {
+                        urls: self.menu.dial.urls(),
+                        icons: &self.page_icons,
+                    };
                     home::add_home(
                         ctx,
                         &mut self.home,
-                        self.menu.dial.urls(),
+                        home::HomeView { pins, mark },
                         self.webview_rect,
                         caret_for(OskField::Home),
-                        face,
                         commands,
                     );
                 }
@@ -651,7 +715,10 @@ impl AppUi {
                     dial_edit::add_dial_edit(
                         ctx,
                         &mut self.dial_edit,
-                        self.menu.dial.urls(),
+                        home::DialPins {
+                            urls: self.menu.dial.urls(),
+                            icons: &self.page_icons,
+                        },
                         caret_for(OskField::DialEdit),
                         face,
                         commands,
@@ -663,7 +730,14 @@ impl AppUi {
                     // The overlay owns its row selection; an egui-focused row
                     // would take Enter a second time and activate twice.
                     drop_egui_focus(ctx);
-                    settings::add_settings(ctx, &self.settings, &update, face, commands);
+                    settings::add_settings(
+                        ctx,
+                        &self.settings,
+                        &update,
+                        &self.input_map_name,
+                        face,
+                        commands,
+                    );
                 }
 
                 // Its own block rather than the chain below, so the keyboard can
@@ -699,17 +773,18 @@ impl AppUi {
 
                 if self.menu.visible {
                     drop_egui_focus(ctx);
-                    menu::add_menu(ctx, &self.menu, &tab_infos, face, commands);
-                } else if self.game_menu.visible {
-                    // Same as the menu's: a focused row would activate twice.
-                    drop_egui_focus(ctx);
-                    game::menu::add_game_menu(
+                    menu::add_menu(
                         ctx,
-                        &self.game_menu,
-                        &self.input_map_name,
-                        self.game_mode,
+                        &self.menu,
+                        &tab_infos,
+                        &self.page_icons,
+                        face,
                         commands,
                     );
+                } else if self.quick_access.visible {
+                    // Same as the menu's: a focused row would activate twice.
+                    drop_egui_focus(ctx);
+                    quick_access::add_quick_access(ctx, &self.quick_access, commands);
                 } else if self.osk.visible {
                     // Clear a bottom toolbar so its address bar stays visible
                     // below the keys.
@@ -735,9 +810,7 @@ impl AppUi {
                     cursor::paint_cursor(ctx, pos, self.scroll_mode, self.edge_scroll);
                 }
 
-                if self.toast_visible_for().is_some() {
-                    game_mode::add_game_mode_toast(ctx, &self.game_mode_toast_text);
-                }
+                self.add_toast(ctx);
 
                 // Drawn last so it sits above everything; non-interactive, so it
                 // never blocks input.

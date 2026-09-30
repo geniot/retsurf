@@ -5,8 +5,9 @@
 //! [`delegate`]; address-bar text interpretation in [`url`]. Around those:
 //! [`engine`] (Servo construction and prefs), [`memory`] (reports and heap
 //! profile), [`pads`] (what the page knows of the gamepads), [`home`] /
-//! [`reader`] (the built-in pages), [`blob_download`] and [`forced_dark`]
-//! (user-content scripts), [`adblock`] and [`content_filter`] (load filtering).
+//! [`reader`] (the built-in pages), [`game_scaling`] (a game sized to the screen),
+//! [`blob_download`] and [`forced_dark`] (user-content scripts), [`adblock`] and
+//! [`content_filter`] (load filtering).
 
 pub mod adblock;
 mod blob_download;
@@ -16,9 +17,12 @@ mod command;
 mod compositing;
 mod delegate;
 mod engine;
+mod favicon;
 mod forced_dark;
+mod game_scaling;
 mod home;
 mod input;
+mod local_site;
 pub mod memory;
 mod reader;
 mod tabs;
@@ -26,7 +30,10 @@ mod url;
 
 pub use command::BrowserCommand;
 pub use engine::effective_user_agent;
+pub use favicon::Favicon;
 pub use home::HOME_URL;
+use local_site::LocalServer;
+pub use local_site::LocalSite;
 pub use url::try_into_url;
 
 mod pads;
@@ -36,7 +43,7 @@ use crate::data::downloads::{BlobDownload, DownloadRequest};
 use crate::platform::clipboard::Clipboard;
 use crate::{
     browser::{adblock::Adblock, content_filter::ContentFilter},
-    config::{AppConfig, ExperimentalConfig, PageTheme},
+    config::{AppConfig, BrowserConfig, ExperimentalConfig, PageTheme},
     event::user::{FrameQueue, UserEvent, UserEventSender},
 };
 use servo::profile_traits::mem::MemoryReportResult;
@@ -56,6 +63,15 @@ const IDB_INDEX_COMPAT_JS: &str = include_str!("assets/idb_index_compat.js");
 /// WebAssembly streaming over a buffered body; a script-made stream never settles.
 const WASM_STREAMING_COMPAT_JS: &str = include_str!("assets/wasm_streaming_compat.js");
 
+/// Something the browser did on its own that the user should hear about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserNotice {
+    /// Opening a tab past the cap closed the oldest one not in view.
+    OldestTabClosed { cap: usize },
+    /// A page asked for a new tab at the cap and was refused.
+    PopupRefused { cap: usize },
+}
+
 pub struct AppBrowser {
     inner: Rc<AppBrowserInner>,
 }
@@ -72,6 +88,21 @@ pub struct BrowserState {
     /// Whether the page holds the Fullscreen API. Per tab, so switching tabs and
     /// closing one need no reset of their own.
     fullscreen: bool,
+    /// What the tab shows over its page.
+    mode: TabMode,
+}
+
+/// What a tab shows over its page. One field, so the views exclude each other.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum TabMode {
+    #[default]
+    Page,
+    /// The article swapped in for the page. Any main-frame load ends it, which
+    /// is also how it is left.
+    Reader,
+    /// Game Mode: the page owns the input and the chrome hides. Outlives
+    /// navigation, and a tab the page opens inherits it.
+    Game,
 }
 
 impl BrowserState {
@@ -100,6 +131,7 @@ impl Default for BrowserState {
             page_url: "".into(),
             loading: false,
             fullscreen: false,
+            mode: TabMode::Page,
         }
     }
 }
@@ -114,6 +146,9 @@ struct Tab {
     /// navigations; per tab so a background load can't spend the visible
     /// page's budget.
     page_images: RefCell<content_filter::PageImages>,
+    /// The page's icon, row-sized; dropped on top-level navigations, since
+    /// Servo keeps the previous page's until the new one names its own.
+    favicon: Option<Favicon>,
 }
 
 impl Tab {
@@ -123,6 +158,7 @@ impl Tab {
             webview,
             state: BrowserState::loading(),
             page_images: RefCell::default(),
+            favicon: None,
         }
     }
 }
@@ -141,6 +177,10 @@ struct AppBrowserInner {
     /// the history log. Sourced from `notify_url_changed` (a real navigation), *not*
     /// the address-bar text — so typing a URL doesn't pollute history.
     visited: FrameQueue<String>,
+    /// Page icons that arrived since the last drain, with the URL of the page
+    /// that named them.
+    new_icons: FrameQueue<(String, Favicon)>,
+    notices: FrameQueue<BrowserNotice>,
     /// Download navigations denied by [`delegate`], drained once per frame.
     download_requests: FrameQueue<DownloadRequest>,
     /// Webviews whose page signalled a captured blob download (see
@@ -158,6 +198,10 @@ struct AppBrowserInner {
     /// Clickable-element rects reported by the page for hint mode (see
     /// [`AppBrowser::collect_hints`]), drained once by the main loop.
     hint_rects: RefCell<Option<Vec<crate::overlay::hints::Hint>>>,
+    /// The [`game_scaling`] mode in force, so each change is applied once.
+    game_scaling: Cell<crate::config::Scaling>,
+    /// Its user script while a mode is on, kept so it can be detached again.
+    game_scaling_script: RefCell<Option<Rc<servo::UserScript>>>,
     /// The live IME request, present while an editable element on the page
     /// holds focus (see [`delegate`]). Plain-key keyboard shortcuts are
     /// suppressed while it's set so they can't hijack typing.
@@ -183,6 +227,10 @@ struct AppBrowserInner {
     /// `[browser] page_theme`. Behind a `Cell` so a settings save can retheme
     /// the open tabs and still be inherited by tabs opened later.
     page_theme: Cell<PageTheme>,
+    /// The User-Agent in force, to skip a save that leaves it unchanged.
+    user_agent: RefCell<String>,
+    /// `[interface] page_icons`: whether tabs keep their page's icon.
+    page_icons: Cell<bool>,
     /// The forced-dark sheet, attached to `user_content` while the theme asks
     /// for it. Kept so it can be detached again.
     forced_dark: Rc<servo::user_contents::UserStyleSheet>,
@@ -190,7 +238,7 @@ struct AppBrowserInner {
     /// here rather than in the event handler because every fresh document has to
     /// be told again: a `Connected` only reaches the document that is loaded.
     pads: RefCell<PadSlots>,
-    /// `[input] haptics`: whether a page may rumble the pad. Gates the requests
+    /// `[controls] haptics`: whether a page may rumble the pad. Gates the requests
     /// and what a `Connected` advertises.
     haptics: Cell<bool>,
     /// Rumble requests from pages, queued by the delegate for the main loop to
@@ -205,6 +253,8 @@ struct AppBrowserInner {
     mem_report: Arc<Mutex<Option<MemoryReportResult>>>,
     /// Shared with every webview, so page fields and the chrome copy to one place.
     clipboard: Rc<Clipboard>,
+    /// A folder served under its own origin.
+    local_site: Option<LocalServer>,
 }
 
 impl AppBrowserInner {
@@ -214,12 +264,13 @@ impl AppBrowserInner {
         event_sender: UserEventSender,
         adblock: Adblock,
         clipboard: Clipboard,
+        local_site: Option<LocalSite>,
         config: &AppConfig,
     ) -> Self {
         let browser = &config.browser;
         let download_exts = config.downloads.extensions.clone();
         let content_filter = ContentFilter::from_config(&config.data_saving);
-        let haptics = config.input.haptics;
+        let haptics = config.controls.haptics;
         // Sanitize the configured zoom: Servo clamps it to [0.1, 10.0] anyway,
         // and a zero/negative/NaN default would make every tab unusable.
         let zoom = browser.page_zoom;
@@ -259,6 +310,8 @@ impl AppBrowserInner {
             repaint_pending: Cell::new(false),
             // History entries only matter once a pass happens anyway.
             visited: FrameQueue::silent(event_sender.clone()),
+            new_icons: FrameQueue::silent(event_sender.clone()),
+            notices: FrameQueue::new(UserEvent::BrowserFrameReady, event_sender.clone()),
             download_requests: FrameQueue::new(UserEvent::DownloadUpdate, event_sender.clone()),
             blob_pings: FrameQueue::new(UserEvent::DownloadUpdate, event_sender.clone()),
             blob_downloads: FrameQueue::new(UserEvent::DownloadUpdate, event_sender.clone()),
@@ -269,6 +322,8 @@ impl AppBrowserInner {
             adblock,
             content_filter: Cell::new(content_filter),
             hint_rects: RefCell::new(None),
+            game_scaling: Cell::new(crate::config::Scaling::Off),
+            game_scaling_script: RefCell::new(None),
             ime_control: Cell::new(None),
             embedder_controls: FrameQueue::new(UserEvent::ControlPending, event_sender.clone()),
             dismissed_controls: FrameQueue::new(UserEvent::ControlPending, event_sender.clone()),
@@ -277,6 +332,8 @@ impl AppBrowserInner {
             hidpi: Cell::new(crate::config::device_scale().unwrap_or(1.0)),
             max_tabs: Cell::new(browser.max_tabs as usize),
             page_theme: Cell::new(browser.page_theme),
+            user_agent: RefCell::new(effective_user_agent(browser)),
+            page_icons: Cell::new(config.interface.page_icons),
             forced_dark,
             pads: RefCell::new(PadSlots::default()),
             haptics: Cell::new(haptics),
@@ -284,6 +341,7 @@ impl AppBrowserInner {
             screen: Cell::new(servo::ScreenGeometry::default()),
             mem_report: Arc::new(Mutex::new(None)),
             clipboard: Rc::new(clipboard),
+            local_site: local_site.map(|site| LocalServer::new(site, event_sender.clone())),
             event_sender,
         }
     }
@@ -365,6 +423,7 @@ impl AppBrowser {
         rendering_ctx: Rc<dyn RenderingContext>,
         event_sender: UserEventSender,
         clipboard: Clipboard,
+        local_site: Option<LocalSite>,
         config: &AppConfig,
     ) -> Result<Self, String> {
         // Path B: Servo renders into an FBO in SDL2's shared GL context
@@ -384,6 +443,7 @@ impl AppBrowser {
             event_sender.clone(),
             Adblock::new(&config.adblock),
             clipboard,
+            local_site,
             config,
         );
 
@@ -403,6 +463,23 @@ impl AppBrowser {
     /// The clipboard the pages share, for the chrome's own fields.
     pub fn clipboard(&self) -> &Clipboard {
         &self.inner.clipboard
+    }
+
+    /// What the active tab shows over its page.
+    pub fn mode(&self) -> TabMode {
+        self.state().mode
+    }
+
+    pub fn set_mode(&self, mode: TabMode) {
+        let active = self.inner.active.get();
+        if let Some(tab) = self.inner.tabs.borrow_mut().get_mut(active) {
+            tab.state.mode = mode;
+        }
+    }
+
+    #[inline]
+    pub fn in_game_mode(&self) -> bool {
+        self.mode() == TabMode::Game
     }
 
     /// Whether the active tab's page holds fullscreen, which hides the chrome.
@@ -441,16 +518,18 @@ impl AppBrowser {
     /// Adopt an edited config's live-tunable knobs, mirroring what [`Self::new`]
     /// read at construction — one list, so a new knob cannot land in only one.
     pub fn apply_config(&self, config: &AppConfig) {
-        self.set_haptics(config.input.haptics);
+        self.set_haptics(config.controls.haptics);
+        self.inner.adblock.set_config(&config.adblock);
         // Lightweight-mode block flags take effect on the next subresource
         // load, no restart needed (unlike the engine-thread counts).
         self.set_content_filter(ContentFilter::from_config(&config.data_saving));
         // Experimental features apply live too — effective on the next page load.
         self.set_experimental_prefs(&config.experimental);
-        // The page theme needs no reload at all: open tabs restyle in place.
         self.set_page_theme(config.browser.page_theme);
+        self.set_user_agent(&config.browser);
         // Binds later opens; the tabs already open stay.
         self.set_max_tabs(config.browser.max_tabs);
+        self.set_page_icons(config.interface.page_icons);
     }
 
     /// Whether any tab is fetching, not just the shown one — a background tab's
@@ -468,6 +547,19 @@ impl AppBrowser {
     #[inline]
     pub fn take_visited(&self) -> Vec<String> {
         self.inner.visited.take()
+    }
+
+    /// Take and clear the notices raised since the last call.
+    #[inline]
+    pub fn take_notices(&self) -> Vec<BrowserNotice> {
+        self.inner.notices.take()
+    }
+
+    /// Take and clear the page icons that arrived since the last call, each
+    /// with the URL of its page.
+    #[inline]
+    pub fn take_new_icons(&self) -> Vec<(String, Favicon)> {
+        self.inner.new_icons.take()
     }
 
     /// Take and clear the download navigations denied since the last call.
@@ -527,6 +619,23 @@ impl AppBrowser {
             tab.webview.notify_theme_change(engine::theme(theme));
             tab.state.loading = true;
             tab.webview.reload();
+        }
+    }
+
+    /// Apply `config`'s User-Agent to later requests and reload the shown tab;
+    /// a no-op when unchanged.
+    fn set_user_agent(&self, config: &BrowserConfig) {
+        let ua = effective_user_agent(config);
+        if *self.inner.user_agent.borrow() == ua {
+            return;
+        }
+        self.inner
+            .servo
+            .set_preference("user_agent", servo::PrefValue::Str(ua.clone()));
+        self.inner.user_agent.replace(ua);
+        if let Some(webview) = self.inner.active_webview() {
+            self.mark_loading();
+            webview.reload();
         }
     }
 

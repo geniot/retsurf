@@ -7,12 +7,12 @@ mod execute;
 mod router;
 
 use crate::command::{
-    AppCommand, GameInputMapsAction, GameMapEditAction, GameMenuAction, InputCommand, MenuAction,
-    PromptAction, SettingsAction,
+    AppCommand, GameInputMapsAction, GameMapEditAction, InputCommand, MenuAction, PromptAction,
+    QuickAccessAction, SettingsAction,
 };
 
-use crate::browser::AppBrowser;
-use crate::data::session::Session;
+use crate::browser::{AppBrowser, Favicon, LocalSite};
+use crate::data::{page_icons, session::Session};
 use crate::event::handler::AppEventHandler;
 use crate::event::user::UserEventSender;
 use crate::platform::clipboard::Clipboard;
@@ -66,6 +66,8 @@ pub struct App {
     /// Holds `SDL_INIT_AUDIO` open for the WebAudio backend ([`crate::media`]);
     /// dropping it closes the sinks' devices. `None` when audio is off/unavailable.
     _audio: Option<sdl2::AudioSubsystem>,
+    /// Opened in place of the usual first tabs; the saved session is left alone.
+    launch_url: Option<String>,
 }
 
 /// How often the main loop flushes the deferred stores — history and the tab
@@ -90,32 +92,43 @@ const HEAP_TRIM_DELAY: Duration = Duration::from_secs(5);
 const SKIPPED_PASS_INTERVAL: Duration = Duration::from_millis(16);
 
 impl App {
-    pub fn new(sdl: &mut Sdl, config: AppConfig) -> Result<Self, String> {
+    pub fn new(
+        sdl: &mut Sdl,
+        config: AppConfig,
+        local_site: Option<LocalSite>,
+    ) -> Result<Self, String> {
         log::info!("init: creating window");
-        let window = AppWindow::new(sdl, &config.display, crate::ui::init_egui_ctx)?;
+        let window = AppWindow::new(
+            sdl,
+            &config.display,
+            config.performance.max_fps,
+            crate::ui::init_egui_ctx,
+        )?;
         // Before the browser: whichever media backend lands first is the one that sticks.
         let audio = crate::media::init(sdl, &config.audio, &config.video);
         log::info!("init: window ready; creating browser");
         let event_sender = UserEventSender::new();
         let clipboard = Clipboard::new(sdl.video()?.clipboard());
+        let launch_url = local_site.as_ref().map(|site| site.start_url.to_string());
         let browser = AppBrowser::new(
             window.rendering_ctx(),
             event_sender.clone(),
             clipboard,
+            local_site,
             &config,
         )?;
         log::info!("init: browser ready; creating event handler + ui");
         // After the engine's threads exist: a thread inherits its creator's
         // nice, so earlier would renice all 59 of them instead of one.
         crate::platform::priority::prioritize_main();
-        let event_handler = AppEventHandler::new(sdl, config.input.clone())?;
+        let event_handler = AppEventHandler::new(sdl, config.controls.clone())?;
         let ui = AppUi::new(
             &window,
-            &config.display,
+            &config.interface,
             &config.history,
             &config.downloads,
             &config.osk,
-            &config.input,
+            &config.controls,
             &config.debug,
             &config.update,
             crate::browser::effective_user_agent(&config.browser),
@@ -150,6 +163,7 @@ impl App {
             last_present: Instant::now(),
             last_pass: Instant::now(),
             _audio: audio,
+            launch_url,
         })
     }
 
@@ -160,19 +174,24 @@ impl App {
         self.browser.set_screen_geometry(screen, window);
     }
 
-    pub fn run(mut self) {
+    pub fn run(mut self, game_mode: bool) {
         self.sync_screen_geometry();
         // Both before the first tab: a page reads `devicePixelRatio` and
         // `screen` while it parses, and only some read them again on resize.
         self.ui.seed_scale(&self.window, &self.browser);
         // A pad plugged in before we started sends no connect event of its own.
         self.event_handler.announce_pads(&self.browser);
+        self.prune_page_icons();
         self.open_first_tabs();
+        let mut commands = Vec::with_capacity(4);
+        // Before the page loads: a game sizes its canvas once.
+        if game_mode {
+            self.enter_game_mode(&mut commands);
+        }
         // Throttled background check for a newer build (`[update] auto_check`); its
         // result surfaces via the toolbar update chip, never a blocking prompt.
         self.ui.update.auto_check(&self.event_sender);
         self.running = true;
-        let mut commands = Vec::with_capacity(4);
 
         while self.running {
             self.browser.pump_event_loop();
@@ -187,6 +206,12 @@ impl App {
             for url in self.browser.take_visited() {
                 self.ui.menu.record_history(&url);
                 self.schedule_heap_trim();
+            }
+            for (url, icon) in self.browser.take_new_icons() {
+                self.store_page_icon(&url, &icon);
+            }
+            for notice in self.browser.take_notices() {
+                self.ui.toast(crate::ui::notice_text(notice));
             }
 
             // A closed document leaves its memory with the allocator rather than
@@ -251,6 +276,7 @@ impl App {
             self.ui.menu.downloads.poll();
             for request in self.browser.take_download_requests() {
                 self.ui.menu.downloads.start(request, &self.event_sender);
+                self.ui.toast("Download started");
             }
             // Rumble a page asked for, played here because the main loop owns
             // the SDL controllers.
@@ -306,7 +332,7 @@ impl App {
             #[cfg(target_os = "android")]
             {
                 let osk_up = self.ui.focus() == crate::ui::Focus::Osk;
-                let want = self.config.input.system_keyboard
+                let want = self.config.controls.system_keyboard
                     && !osk_up
                     && (self.ui.wants_keyboard() || self.browser.text_input_focused());
                 crate::platform::window::set_text_input(want);
@@ -382,6 +408,10 @@ impl App {
     /// Fill the empty tab list at startup: the saved session, or the home page
     /// when there is none. `restore_tabs` off drops the stored session instead.
     fn open_first_tabs(&mut self) {
+        if let Some(url) = &self.launch_url {
+            self.browser.open_tab(url);
+            return;
+        }
         if !self.config.browser.restore_tabs {
             self.session.discard();
         } else if self
@@ -393,6 +423,30 @@ impl App {
         self.browser.open_tab(&self.config.browser.home_page);
     }
 
+    /// Cache `url`'s site icon for the saved lists. With history off only the
+    /// bookmarked and pinned sites are kept, or the cache would be a history.
+    fn store_page_icon(&self, url: &str, icon: &Favicon) {
+        let Some(host) = page_icons::host_key(url) else {
+            return;
+        };
+        if self.config.history.enabled || self.ui.menu.icon_hosts(false).contains(&host) {
+            page_icons::save(&host, icon);
+        }
+    }
+
+    /// Drop the icons of hosts nothing references any more: the lists trim
+    /// themselves, the cache does not.
+    fn prune_page_icons(&self) {
+        let mut keep = self.ui.menu.icon_hosts(true);
+        keep.extend(
+            self.session
+                .urls()
+                .iter()
+                .filter_map(|u| page_icons::host_key(u)),
+        );
+        page_icons::prune(&keep);
+    }
+
     /// Ask the allocator for its free memory back once the document being torn
     /// down has finished going away (see [`HEAP_TRIM_DELAY`]).
     fn schedule_heap_trim(&mut self) {
@@ -402,7 +456,7 @@ impl App {
     /// Snapshot the open tabs for the next launch. A no-op with `restore_tabs`
     /// off, and a tab list unchanged since the last snapshot writes nothing.
     fn save_session(&mut self) {
-        if self.config.browser.restore_tabs {
+        if self.config.browser.restore_tabs && self.launch_url.is_none() {
             self.session.record(&self.browser.tabs());
         }
     }
